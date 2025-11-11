@@ -179,6 +179,7 @@ Buffer::Buffer(int rank,
 
     if (num_nvl_bytes > 0) {
         // Local IPC: alloc local memory and set local IPC handles
+        // INFO(ljjia): Order: nvl_buffer, barrier value(8*int ), nvl_buffer_ptrs(8*ptr), barrier_ptrs(8*ptr)
         shared_memory_allocator.malloc(&buffer_ptrs[nvl_rank],
                                        num_nvl_bytes + barrier_signal_bytes + buffer_ptr_bytes + barrier_signal_ptr_bytes);
         shared_memory_allocator.get_mem_handle(&ipc_handles[nvl_rank], buffer_ptrs[nvl_rank]);
@@ -591,7 +592,11 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
         intranode::cached_notify_dispatch(
             rank_prefix_matrix.data_ptr<int>(), num_memset_int, buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank, num_ranks, comm_stream);
     } else {
+        // [num_ranks, num_ranks], (i, j)表示rank j从rank_0->rank_i接收的token数量
+        // 这是一个全局的视角, 有的rank拥有相同的tensor
         rank_prefix_matrix = torch::empty({num_ranks, num_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+        // [num_ranks, num_channels], (i, j)表示当前rank的channel 0->channel j要给rank_i发送的token数量
+        // 这是一个局部的视角, 描述了本地的多少个token要发给每个rank, 每个rank的tensor都不一样
         channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
 
         // Send sizes

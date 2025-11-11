@@ -69,6 +69,7 @@ private:
     void* rdma_buffer_ptr = nullptr;
 
     // Shrink mode buffer
+    // INFO(ljjia): we assume it == false
     bool enable_shrink = false;
     int* mask_buffer_ptr = nullptr;
     int* sync_buffer_ptr = nullptr;
@@ -77,7 +78,7 @@ private:
     int device_id;
     int num_device_sms;
     int rank, rdma_rank, nvl_rank;
-    int num_ranks, num_rdma_ranks, num_nvl_ranks;
+    int num_ranks/* global ranks */, num_rdma_ranks, num_nvl_ranks;
     shared_memory::MemHandle ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication

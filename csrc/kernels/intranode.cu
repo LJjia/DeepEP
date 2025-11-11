@@ -29,6 +29,11 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
     auto lane_id = thread_id % 32, warp_id = thread_id / 32, num_warps = num_threads / 32;
 
     if (sm_id == 0) {
+        /***************************************
+        all gather num_tokens_per_rank and num_tokens_per_expert
+        src: num_tokens_per_rank/num_tokens_per_expert
+        dst: per_rank_buffer/per_expert_buffer
+        ***************************************/
         // Barrier first
         barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
 
@@ -52,6 +57,14 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         // Wait for all ranks to be finished
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
 
+        /***************************************
+        then all rank has global num_tokens_per_rank, do a prefix itself
+        we have local_per_rank_buffer[i, j] mean the number of tokens from rank i to rank j
+        prefix sum local_per_rank_buffer[i, j] dim = i -> local_per_rank_buffer[i, j]
+        mean rank j total recv tokens from rank_0 -> rank_i
+        but for prefix experts of ranks, we only need static total num and write to cpu
+        ***************************************/
+
         // Sum per-rank counts and return to CPU
         // Also pre-compute the prefix sum for data sending
         auto local_per_rank_buffer = static_cast<int*>(buffer_ptrs[rank]);
@@ -60,6 +73,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
             for (int i = 1; i < kNumRanks; ++i)
                 local_per_rank_buffer[i * kNumRanks + thread_id] += local_per_rank_buffer[(i - 1) * kNumRanks + thread_id];
             if (thread_id == rank)
+                // self total need prepare tokens num
                 *moe_recv_counter_mapped = local_per_rank_buffer[(kNumRanks - 1) * kNumRanks + rank];
         }
 
@@ -79,7 +93,11 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         #pragma unroll
         for (int i = thread_id; i < kNumRanks * kNumRanks; i += num_threads)
             rank_prefix_matrix_copy[i] = local_per_rank_buffer[i];
-
+        /***************************************
+        first local_per_expert_buffer is shape [kNumRanks, num_experts_per_rank]
+        but here resize to 
+        num_memset_int = num_channels * num_ranks * 4
+        ***************************************/
         // Extra memset for later communication queue
         #pragma unroll
         for (int i = thread_id; i < num_memset_int; i += num_threads)
@@ -88,6 +106,14 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         // Barrier
         barrier_block<kNumRanks>(barrier_signal_ptrs, rank);
     } else {
+        /***************************************
+        per block response for a dst rank
+        total channel num is define by external
+        but worker(channel_id) is warp id in block
+        total tokens is divide by channel num. per channel resopnse for serveral continguous tokens
+        channel_prefix_matrix, shape [ranks, num_channels]
+        channel_prefix_matrix[i, j] is rank_i recv tokens for local_rank channel_0->channel_j
+        ***************************************/
         int dst_rank = sm_id - 1;
         for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
             int token_start_idx, token_end_idx;
@@ -197,20 +223,20 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            float* recv_x_scales,
-                                                           int* recv_src_idx,
+                                                           int* recv_src_idx, // [num_recv_tokens]
                                                            topk_idx_t* recv_topk_idx,
                                                            float* recv_topk_weights,
-                                                           int* recv_channel_offset,
-                                                           int* send_head,
+                                                           int* recv_channel_offset, // [num_ranks, num_channel]
+                                                           int* send_head, // [num_tokens, num_ranks]
                                                            const int4* x,
                                                            const float* x_scales,
-                                                           const topk_idx_t* topk_idx,
+                                                           const topk_idx_t* topk_idx, // [num_tokens, num_topk]
                                                            const float* topk_weights,
                                                            const bool* is_token_in_rank,
                                                            const int* channel_prefix_matrix,
                                                            int num_tokens,
                                                            int num_worst_tokens,
-                                                           int hidden_int4,
+                                                           int hidden_int4, /* hidden_bytes/128Bytes */
                                                            int num_topk,
                                                            int num_experts,
                                                            int num_scales,
@@ -218,8 +244,8 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            int scale_hidden_stride,
                                                            void** buffer_ptrs,
                                                            int rank,
-                                                           int num_max_send_tokens,
-                                                           int num_recv_buffer_tokens) {
+                                                           int num_max_send_tokens, /* chunk_tokens like 8*/
+                                                           int num_recv_buffer_tokens /* chunk_tokens like 256 */) {
     const auto num_sms = static_cast<int>(gridDim.x), sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
     const bool is_sender = sm_id % 2 == 0;
@@ -228,6 +254,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
     // Several warps are response for a single rank
     const auto num_threads_per_rank = kNumThreads / kNumRanks;
     const auto num_channels = num_sms / 2;
+    /***************************************
+    thread in same block response for same channel, but thread in different warp response for different rank
+    ***************************************/
     const auto responsible_rank = (static_cast<int>(thread_id)) / num_threads_per_rank;
     // Even-numbered blocks for sending, odd-numbered blocks for receiving.
     const auto responsible_channel = sm_id / 2;
@@ -240,6 +269,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 
     // Calculate pointers by the specific layout
     // `rank_prefix_matrix`: kNumRanks * kNumRanks * sizeof(int)
+    /***************************************
+    this buffer is memset to zero by notify kernel
+    so notify kernel memset size is 4*(num_channels * num_ranks)
+    4 correspond to here channel_start_offset, channel_end_offset, channel_head_idx, channel_tail_idx
+    per format is shape [num_channels, kNumRanks]
+    ***************************************/
     auto ptr = reinterpret_cast<void*>(static_cast<int8_t*>(buffer_ptrs[is_sender ? responsible_rank : rank]) +
                                        kNumRanks * kNumRanks * sizeof(int));
     int target_rank = is_sender ? rank : responsible_rank;
@@ -293,6 +328,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
 #endif
 
     if (is_sender) {
+        /***************************************
+        there is 768 threads, rank_size == 8,
+        96 threads (3warp) per rank
+        num_send_warps == 24
+        num_send_warps_per_rank == 3
+        ***************************************/
         // Workers for sending
         constexpr int num_send_warps = kNumThreads / 32;
         constexpr int num_send_warps_per_rank = num_send_warps / kNumRanks;
@@ -301,6 +342,16 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         EP_DEVICE_ASSERT(kNumRanks <= 32);
         EP_DEVICE_ASSERT(num_send_warps % kNumRanks == 0);
 
+        /***************************************
+        per block response one channel, select one thread for one rank in a block,
+        total stg [num_channel, num_rank]
+        channel_prefix_matrix is shape [num_channel, num_rank]
+        note: here we read local channel_prefix_matrix, which channel_prefix_matrix[i, j] response to
+        local_rank need **send** token num from channel_0->channel_i to rank_j
+        stg to remote channel_start_offset, shape is same [num_channel, num_rank],
+        but the other side read channel_start_offset[i, j] response to self need **recv** tokens 
+        from rank_j 's channel_0->channel_j
+        ***************************************/
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
         if (send_warp_id_in_rank == 0 and elect_one_sync()) {
@@ -323,6 +374,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             auto start_time = clock64();
             if (elect_one_sync()) {
                 while (true) {
+                    /***************************************
+                    sender stg tail ldg head, receiver stg head read tail.
+                    num_used_slots is like how many tensor we cached, num_recv_buffer_tokens is how many tensor we can total store
+                    ***************************************/
                     // NOTES: we only consider the worst case, because counting the real numbers are time-consuming
                     int num_used_slots = cached_channel_tail_idx - ld_volatile_global(channel_head_idx.buffer());
                     if (num_recv_buffer_tokens - num_used_slots >= num_max_send_tokens)
@@ -378,6 +433,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                         channel_topk_weights_buffers[dst_slot_idx * num_topk + lane_id] = weight_value;
                     }
 
+                    /***************************************
+                    ds scale is 128 elts per scale, 
+                    scale is [num_token, num_scale] (num_scale: 7168/128=56), scaler may be fp32 and int32...
+                    so scale_hidden_stride is sizeof(dtype), scale_token_stride is num_scale*sizeof(dtype)
+                    ***************************************/
                     // Copy `x_scales`
                     #pragma unroll
                     for (int i = lane_id; i < num_scales; i += 32) {
@@ -406,6 +466,14 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         EP_DEVICE_ASSERT(kNumRanks <= 32);
         EP_DEVICE_ASSERT(recv_thread_id >= 0 and num_recv_warps % kNumRanks == 0);
 
+
+        /***************************************
+        first ldg rank idx token offset, inside the rank offset, there are channel offset,
+        then ldg channel offset, add. get total_offset
+        num_tokens_to_recv is this channel need recv how many tokens
+        notify output channel_prefix_matrix is local rank **send** tokens to other rank,
+        but here channel_start_offset is local rank need **recv** from other rank
+        ***************************************/
         // Calculate offset first
         auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
         int rank_offset = responsible_rank > 0 ? rank_prefix_matrix[(responsible_rank - 1) * kNumRanks + rank] : 0;
@@ -429,6 +497,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         // Shared tail indices for different warps
         __shared__ volatile int shared_channel_tail_idx[kNumRanks];
 
+        /***************************************
+        first, send update tail, then receiver read tail
+        only one thread ldg to shared, all thread update self cached_channel_tail_idx from shared
+        ***************************************/
         auto start_time = clock64();
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         while (num_tokens_to_recv > 0) {
@@ -496,7 +568,6 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                 recv_topk_idx[recv_idx] = ld_nc_global(channel_topk_idx_buffers.buffer() + buffer_idx);
                 recv_topk_weights[recv_idx] = ld_nc_global(channel_topk_weights_buffers.buffer() + buffer_idx);
             }
-
             // Copy `x_scales`
             #pragma unroll 4
             for (int i = recv_thread_id_in_rank; i < num_recv_tokens * num_scales; i += 32 * num_recv_warps_per_rank) {
@@ -518,6 +589,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         }
     }
 
+    /***************************************
+    acutal recv tokens(num_tokens_to_recv) -> num_worst_tokens
+    [num_worst_tokens-num_tokens_to_recv, topk]
+    recv_topk_idx memset to -1
+    ***************************************/
     // Clean unused `recv_topk_idx` as -1
     if (num_worst_tokens > 0) {
         auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
