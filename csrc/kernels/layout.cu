@@ -62,6 +62,8 @@ __global__ void get_dispatch_layout(const topk_idx_t* topk_idx,
     int rank_begin_idx = (sm_id - sm_begin) * kNumRanksPerSM, rank_end_idx = min(rank_begin_idx + kNumRanksPerSM, num_ranks);
     int rdma_rank_begin_idx = rank_begin_idx / NUM_MAX_NVL_PEERS, rdma_rank_end_idx = rank_end_idx / NUM_MAX_NVL_PEERS;
     if (rank_begin_idx < rank_end_idx) {
+        // kNumThreads = 256, kNumExpertsPerSM = 4, kNumRanksPerSM = 8
+        // num_expert_per_rank: prefill 8, decode 2
         const auto num_expert_per_rank = num_experts / num_ranks;
         auto expert_begin = rank_begin_idx * num_expert_per_rank;
         auto expert_end = rank_end_idx * num_expert_per_rank;
