@@ -30,7 +30,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
 
     if (sm_id == 0) {
         /***************************************
-        all gather num_tokens_per_rank and num_tokens_per_expert
+        all gather num_tokens_per_rank and alltoall num_tokens_per_expert
         src: num_tokens_per_rank/num_tokens_per_expert
         dst: per_rank_buffer/per_expert_buffer
         ***************************************/
@@ -112,7 +112,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         but worker(channel_id) is warp id in block
         total tokens is divide by channel num. per channel resopnse for serveral continguous tokens
         channel_prefix_matrix, shape [ranks, num_channels]
-        channel_prefix_matrix[i, j] is rank_i recv tokens for local_rank channel_0->channel_j
+        channel_prefix_matrix[i, j] is rank_i recv tokens for local_rank channel_0->channel_j, ro local channel_0->channel_j send to rank_i
         ***************************************/
         int dst_rank = sm_id - 1;
         for (int channel_id = warp_id; channel_id < num_channels; channel_id += num_warps) {
@@ -473,6 +473,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         num_tokens_to_recv is this channel need recv how many tokens
         notify output channel_prefix_matrix is local rank **send** tokens to other rank,
         but here channel_start_offset is local rank need **recv** from other rank
+        FIXME: maybe we can make receiver get recv_channel_prefix_matrix directly?
         ***************************************/
         // Calculate offset first
         auto rank_prefix_matrix = static_cast<int*>(buffer_ptrs[rank]);
