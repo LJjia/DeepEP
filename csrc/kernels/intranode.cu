@@ -697,6 +697,10 @@ void dispatch(void* recv_x,
 template <int kNumRanks>
 __global__ void cached_notify_combine(
     void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens, int num_memset_int, int** barrier_signal_ptrs, int rank) {
+    /***************************************
+    num_recv_tokens here is send_head.shape[0], which mean this rank's local total token num,
+    before do dispatch. how many tokens this rank had.
+    ***************************************/
     const auto sm_id = static_cast<int>(blockIdx.x);
     if (sm_id == 0) {
         // Barrier before cleaning
@@ -729,6 +733,12 @@ __global__ void cached_notify_combine(
         for (int token_idx_tail = token_end_idx - 1; token_idx_tail >= token_start_idx; token_idx_tail -= 32) {
             int token_idx = token_idx_tail - lane_id, expected_head = 0;
             auto current_head = (token_idx >= token_start_idx) ? __ldg(send_head + token_idx * kNumRanks + rank_id) : -1;
+            /***************************************
+            this loop make these response for stg thread's expected_head
+            1. if current_head > 0, expected_head == 0, not change
+            2. if current_head < 0, order for how many tokens before them, for -1 -> -(1<<25), abs increase.
+            start from -1, decrease 1 per token, end as -(1<<25)
+            ***************************************/
             for (int i = 0; i < min(32, token_idx_tail - token_start_idx + 1); ++i) {
                 const int head = __shfl_sync(0xffffffff, current_head, i);
                 if (head < 0) {
@@ -738,6 +748,9 @@ __global__ void cached_notify_combine(
                     last_head = head;
                 }
             }
+            /***************************************
+            watch out, here make a mask, only current_head < 0 will stg. so origin expected_head>=0 will not change
+            ***************************************/
             if (current_head < 0 and token_idx >= token_start_idx)
                 send_head[token_idx * kNumRanks + rank_id] = expected_head;
         }
