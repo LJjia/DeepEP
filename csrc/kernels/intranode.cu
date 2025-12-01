@@ -345,12 +345,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
         /***************************************
         per block response one channel, select one thread for one rank in a block,
         total stg [num_channel, num_rank]
-        channel_prefix_matrix is shape [num_channel, num_rank]
+        channel_prefix_matrix is shape [num_rank, num_channel]
         note: here we read local channel_prefix_matrix, which channel_prefix_matrix[i, j] response to
-        local_rank need **send** token num from channel_0->channel_i to rank_j
-        stg to remote channel_start_offset, shape is same [num_channel, num_rank],
+        local_rank need **send** token num from channel_0->channel_j to rank_i
+        stg to remote channel_start_offset, shape is same [num_rank, num_channel],
         but the other side read channel_start_offset[i, j] response to self need **recv** tokens 
-        from rank_j 's channel_0->channel_j
+        from rank_i 's channel_0->channel_j
         ***************************************/
         // Send offset by `-value - 1`, e.g. 0 -> -1, 1 -> -2
         // NOTES: this is for distinguishing zero tokens
@@ -542,7 +542,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
             for (int chunk_idx = recv_warp_id_in_rank; chunk_idx < num_recv_tokens; chunk_idx += num_recv_warps_per_rank) {
                 int token_idx_in_buffer = (cached_channel_head_idx + chunk_idx) % num_recv_buffer_tokens;
                 auto shifted_buffer_x_int4 = channel_x_buffers.buffer() + token_idx_in_buffer * hidden_int4;
-                auto shifted_re             cv_x_int4 = recv_x + static_cast<int64_t>(total_offset + chunk_idx) * hidden_int4;
+                auto shifted_recv_x_int4 = recv_x + static_cast<int64_t>(total_offset + chunk_idx) * hidden_int4;
 #ifndef DISABLE_SM90_FEATURES
                 #pragma unroll
                 for (int i = 0; i < 2; ++i) {
