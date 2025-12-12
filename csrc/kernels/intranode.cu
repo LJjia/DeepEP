@@ -220,6 +220,10 @@ void cached_notify_dispatch(const int* rank_prefix_matrix,
 #undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
 }
 
+/***************************************
+num_recv_tokens is how many this rank will recv
+num_tokens is how many this token origin have
+***************************************/
 template <int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
 __global__ void __launch_bounds__(kNumThreads, 1) dispatch(int4* recv_x,
                                                            float* recv_x_scales,
@@ -787,14 +791,18 @@ void cached_notify_combine(void** buffer_ptrs,
 #undef CACHED_NOTIFY_COMBINE
 }
 
+/***************************************
+num_tokens is how many tokens this rank's expert need
+num_recv_tokens is how many otokens this rank finnal have
+***************************************/
 template <typename dtype_t, int kNumRanks, int kNumThreads, int kNumTMABytesPerWarp>
-__global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
+__global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x, // [num_recv_tokens, hidden]
                                                           float* recv_topk_weights,
-                                                          const dtype_t* x,
+                                                          const dtype_t* x, // [num_tokens, hidden]
                                                           const float* topk_weights,
                                                           const dtype_t* bias_0,
                                                           const dtype_t* bias_1,
-                                                          const int* src_idx,
+                                                          const int* src_idx, // [num_tokens]
                                                           const int* rank_prefix_matrix,    // [num_rank, num_rank]
                                                           const int* channel_prefix_matrix, // [num_channel, num_rank] (recv side)
                                                           int* send_head,
@@ -872,10 +880,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
         int rank_offset = send_rank_id > 0 ? rank_prefix_matrix[(send_rank_id - 1) * kNumRanks + rank] : 0;
         int num_rank_tokens = rank_prefix_matrix[send_rank_id * kNumRanks + rank] - rank_offset;
         /***************************************
-        unlike rank_offset, rank_offset is like start_idx_offset, 
+        rank_offset is rank start offset, 
         channel_prefix_matrix is dispatch kernel recv_channel_offset tensor, actual is channel start offset.
-        so channel_offset is start idx offset
         num_channel_tokens is channel_end offset - channel_start offset
+        tokens in input x is dense arrangement, first rank, then channel
+        token_start_idx,token_end_idx is total offset int input x
         ***************************************/
         int channel_offset = channel_prefix_matrix[send_rank_id * num_channels + responsible_channel];
         int num_channel_tokens =
@@ -890,6 +899,11 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
         for (int64_t token_idx = token_start_idx; token_idx < token_end_idx;) {
             // Check destination queue emptiness, or wait a buffer to be released (rare cases)
             auto start_time = clock64();
+            /***************************************
+            copy data from input x -> ipc buffer
+            min copy tokens is num_max_send_tokens
+            first we need checkout buffer has enough slots num
+            ***************************************/
             int num_round_tokens = min(num_max_send_tokens, token_end_idx - static_cast<int>(token_idx));
             if (elect_one_sync()) {
                 while (true) {
@@ -930,6 +944,12 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             token_idx += num_round_tokens;
             current_channel_tail_idx += num_round_tokens;
 
+            /***************************************
+            same as dispatch, sender update tail, receiver update head
+            here what sender do is that: copy contiguous layout [ranks, channels] tensor copy to
+            ipc buffer [channels, ranks] padding align.
+            src is input buffer x, output is remote ipc buffer, a group of warp response for a rank
+            ***************************************/
             // Move tail index
             asm volatile("bar.sync %0, %1;" ::"r"(send_rank_id), "r"(num_threads_per_rank));
             if (send_warp_id_in_rank == 0 and elect_one_sync())
@@ -964,6 +984,10 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             while (lane_id < kNumRanks) {
                 // Check retired
                 bool retired = true;
+                /***************************************
+                num_recv_warps is total warp, not only idx 1-num_recv_warp-1 do combine work,
+                so here for loop always start from idx == 1
+                ***************************************/
                 #pragma unroll
                 for (int i = 1; i < num_recv_warps; ++i)
                     retired = retired and warp_retired[i];
@@ -986,9 +1010,24 @@ __global__ void __launch_bounds__(kNumThreads, 1) combine(dtype_t* recv_x,
             // Receivers
             // Channel metadata
             // All lanes will use data buffer, but only rank lane will use `head/tail/src_idx`
+            /***************************************
+            recviver response for cpy data from local ipc buffer -> local ouput buffer
+            ***************************************/
+
+            /***************************************
+            TODO(ljjia): 
+            per warp all need all rank ptr?
+            ***************************************/
             Buffer<int4> channel_x_buffers[kNumRanks];
             Buffer<float> channel_topk_weights_buffers[kNumRanks];
 
+            /***************************************
+            determine different rank ptr layout in ipc buffer
+            0. `head_idx` & `tail_idx`:     kNumChannels * kNumRanks * sizeof(int)
+            1. `x_buffers`:                 kNumChannels * kNumRanks * num_recv_buffer_tokens * hidden_int4 * sizeof(int4)
+            2. `src_idx_buffers`:           kNumChannels * kNumRanks * num_recv_buffer_tokens * sizeof(int)
+            3. `topk_weights_buffers`:      kNumChannels * kNumRanks * num_recv_buffer_tokens * num_topk * sizeof(float)
+            ***************************************/
             // Calculate pointers by the specific layout
             #pragma unroll
             for (int i = 0; i < kNumRanks; ++i) {
