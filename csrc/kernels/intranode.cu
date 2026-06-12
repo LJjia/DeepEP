@@ -33,6 +33,8 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         all gather num_tokens_per_rank and alltoall num_tokens_per_expert
         src: num_tokens_per_rank/num_tokens_per_expert
         dst: per_rank_buffer/per_expert_buffer
+        Original code, num_tokens_per_rank do full allgather, input num_tokens_per_rank shape [nranks,] -> output rank_prefix_matrix shape[nranks, nranks]
+        but actual rank_prefix_matrix only self rank, so here allgather result only has rank_prefix_matrix shape[nranks, rank] result, which mean has 1 column result for prefixsum is enough
         ***************************************/
         // Barrier first
         barrier_block<kNumRanks, true>(barrier_signal_ptrs, rank);
@@ -60,7 +62,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
         /***************************************
         then all rank has global num_tokens_per_rank, do a prefix itself
         we have local_per_rank_buffer[i, j] mean the number of tokens from rank i to rank j
-        prefix sum local_per_rank_buffer[i, j] dim = i -> local_per_rank_buffer[i, j]
+        do prefix sum local_per_rank_buffer[i, j] int dim = i -> local_per_rank_buffer[i, j]
         mean rank j total recv tokens from rank_0 -> rank_i
         but for prefix experts of ranks, we only need static total num and write to cpu
         ***************************************/
